@@ -3,7 +3,7 @@ import { expect, test } from "../helpers/fixtures.js";
 test("the page loads in a real browser", async ({ page }) => {
   await page.goto("/");
 
-  await expect(page.getByRole("heading", { name: "V1be Coding" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Not V1be Coding" })).toBeVisible();
 });
 
 test("the API answers through the page", async ({ page }) => {

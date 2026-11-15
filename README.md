@@ -4,7 +4,7 @@ Phase F's throwaway episode, made from `episode-template` to prove the Foundatio
 
 ## Sites
 
-- **Production:** https://phase-f.emilianocasijr.com
+- **Production:** https://phase-f.emilianocasijr.com, behind Cloudflare.
 - **Branch environments:** each ready PR gets its own address, printed as `Branch environment: <url>` in its `branch / deploy` job log.
 
 ## Database
