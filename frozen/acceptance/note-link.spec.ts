@@ -145,7 +145,9 @@ test("C11: the page shows unavailable when the note request fails with a 500 or 
 });
 
 test.describe("a rate-limited note", () => {
-  // The 429 here is a stand-in from page.route, not a real one.
+  // The 429 here is a stand-in from page.route, not a real one. The spec doesn't
+  // say whether `Note: ` comes before the limit message, so only the message is
+  // checked (see "Not checked" in #11's test contract).
   test.use({ allow429: true });
 
   test("C12: the page shows the limit message when the note request is rate-limited", { tag: ["@C12"] }, async ({ page }) => {
