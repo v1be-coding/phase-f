@@ -1,0 +1,148 @@
+# Temporary. Phase F's permission checks, run as phase-f's CI role with a real
+# pull_request token (ADR-0010, ADR-0011, ADR-0012, Q45). Open it as a draft PR,
+# so the deploy chain stops early, and close the PR unmerged once it has run.
+#
+# Every attempt is safe if a fence fails:
+# - Updates send back the current value, or a wrong ETag, so nothing changes.
+# - The route delete and the untags name things that don't exist.
+# - A role or CloudFront Function made by mistake is reported as a FAIL, and the
+#   role is removed again.
+# - Two attempts could change something, and phase-f is a throwaway: deleting
+#   phase-f's own production cluster, which deletion protection should refuse, and
+#   the invalidation of smoke-test's distribution, which only clears a cache.
+#
+# The cluster IDs are already public in each repo's deploy logs.
+name: permission probe
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions: {}
+
+jobs:
+  probe:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+    env:
+      ACCOUNT_ID: ${{ secrets.PORTFOLIO_ACCOUNT_ID }}
+      EPISODE: ${{ vars.EPISODE }}
+      AWS_REGION: ap-southeast-1
+      OTHER: smoke-test
+      OWN_CLUSTER: 65uhoimr5vuka4zu4qk4ab5zxi
+      OTHER_CLUSTER: nzug2l5gu5ilmy6dr7nuhkbla4
+    steps:
+      - name: Try what phase-f's CI role must not do
+        run: |
+          token=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          echo "::add-mask::$token"
+          printf %s "$token" > "$RUNNER_TEMP/oidc-token"
+          export AWS_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/v1be-$EPISODE-ci"
+          export AWS_WEB_IDENTITY_TOKEN_FILE="$RUNNER_TEMP/oidc-token"
+
+          failed=0
+          results=()
+          record() { echo "$1: $2"; results+=("| $2 | $1 |"); [ "$1" = PASS ] || failed=1; }
+          # Prints only the error code, because AWS's messages hold the account ID.
+          code() { grep -o 'An error occurred ([A-Za-z]*)' <<<"$1" | head -1 | sed 's/An error occurred //'; }
+
+          expect_ok() {
+            name="$1"; shift
+            if out=$("$@" 2>&1); then record PASS "$name"; else record FAIL "$name: $(code "$out")"; fi
+          }
+          expect_denied() {
+            name="$1"; shift
+            if out=$("$@" 2>&1); then
+              record FAIL "$name succeeded"
+            elif grep -qE 'AccessDenied|not authorized' <<<"$out"; then
+              record PASS "$name refused"
+            else
+              record FAIL "$name: $(code "$out")"
+            fi
+          }
+
+          # Controls: reads that must work, or a refusal below proves nothing.
+          expect_ok "CI signs in as its role" aws sts get-caller-identity --query Arn --output text
+          expect_ok "CI reads its own secret's name" aws ssm get-parameter \
+            --name "/$EPISODE/internal/api-origin" --query Parameter.Name --output text
+
+          other_api=$(aws apigatewayv2 get-apis --query "Items[?Name=='v1be-$OTHER-api'].ApiId | [0]" --output text || true)
+          [ -n "$other_api" ] && [ "$other_api" != None ] && record PASS "CI finds $OTHER's API" \
+            || record FAIL "CI can't find $OTHER's API"
+          dist() { aws cloudfront list-distributions --output text \
+            --query "DistributionList.Items[?Aliases.Items[0]=='$1.emilianocasijr.com'].Id | [0]" || true; }
+          other_dist=$(dist "$OTHER")
+          own_dist=$(dist "$EPISODE")
+          aws cloudfront get-distribution-config --id "$other_dist" > "$RUNNER_TEMP/other.json" \
+            && record PASS "CI reads $OTHER's distribution" || record FAIL "CI can't read $OTHER's distribution"
+          aws cloudfront get-distribution-config --id "$own_dist" > "$RUNNER_TEMP/own.json" \
+            && record PASS "CI reads its own production distribution" \
+            || record FAIL "CI can't read its own production distribution"
+          jq .DistributionConfig "$RUNNER_TEMP/other.json" > "$RUNNER_TEMP/other-same.json"
+          jq .DistributionConfig "$RUNNER_TEMP/own.json" > "$RUNNER_TEMP/own-same.json"
+
+          # ADR-0011: another episode's secrets, API, routes, distribution and cluster.
+          expect_denied "read $OTHER's secret" aws ssm get-parameter \
+            --name "/$OTHER/internal/api-origin" --query Parameter.Name --output text
+          expect_denied "search $OTHER's secrets by path" aws ssm get-parameters-by-path \
+            --path "/$OTHER/" --query "Parameters[].Name" --output text
+          expect_denied "update $OTHER's API" aws apigatewayv2 update-api \
+            --api-id "$other_api" --name "v1be-$OTHER-api"
+          expect_denied "delete a route on $OTHER's API" aws apigatewayv2 delete-route \
+            --api-id "$other_api" --route-id probe00
+          expect_denied "invalidate $OTHER's distribution" aws cloudfront create-invalidation \
+            --distribution-id "$other_dist" --paths /phase-f-probe
+          expect_denied "update $OTHER's distribution" aws cloudfront update-distribution \
+            --id "$other_dist" --if-match WRONG-ETAG --distribution-config "file://$RUNNER_TEMP/other-same.json"
+          other_cluster_arn="arn:aws:dsql:$AWS_REGION:$ACCOUNT_ID:cluster/$OTHER_CLUSTER"
+          expect_denied "read $OTHER's cluster" aws dsql get-cluster --identifier "$OTHER_CLUSTER"
+          expect_denied "untag $OTHER's cluster" aws dsql untag-resource \
+            --resource-arn "$other_cluster_arn" --tag-keys phase-f-probe-no-such-key
+          expect_denied "delete $OTHER's cluster" aws dsql delete-cluster --identifier "$OTHER_CLUSTER"
+
+          # ADR-0010: production's edge, CloudFront Functions and the origin secret.
+          expect_denied "update its own production distribution" aws cloudfront update-distribution \
+            --id "$own_dist" --if-match WRONG-ETAG --distribution-config "file://$RUNNER_TEMP/own-same.json"
+          printf 'function handler(event) { return event.request; }\n' > "$RUNNER_TEMP/fn.js"
+          expect_denied "create a CloudFront Function" aws cloudfront create-function \
+            --name "v1be-$EPISODE-probe" --function-config "Comment=probe,Runtime=cloudfront-js-2.0" \
+            --function-code "fileb://$RUNNER_TEMP/fn.js"
+          kvs=$(aws cloudfront list-key-value-stores --query "KeyValueStoreList.Items[0].ARN" --output text 2>/dev/null || true)
+          if [ -n "$kvs" ] && [ "$kvs" != None ]; then
+            expect_denied "list the origin secret's keys" aws cloudfront-keyvaluestore list-keys --kvs-arn "$kvs"
+          else
+            record FAIL "no KeyValueStore found to probe"
+          fi
+
+          # ADR-0012: v1be-infra's state.
+          expect_denied "list v1be-infra-state" aws s3api list-objects-v2 --bucket v1be-infra-state --max-items 1
+          expect_denied "read edge's state" aws s3api head-object --bucket v1be-infra-state --key edge/terraform.tfstate
+
+          # ADR-0011: every role CI makes carries the boundary.
+          printf '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}' \
+            > "$RUNNER_TEMP/trust.json"
+          expect_denied "create a role with no boundary" aws iam create-role \
+            --role-name "v1be-$EPISODE-probe-unbounded" --assume-role-policy-document "file://$RUNNER_TEMP/trust.json"
+          aws iam delete-role --role-name "v1be-$EPISODE-probe-unbounded" >/dev/null 2>&1 || true
+
+          # Q45: a run can't turn off deletion protection, so it can't delete production's cluster.
+          expect_denied "turn off its own cluster's deletion protection" aws dsql update-cluster \
+            --identifier "$OWN_CLUSTER" --no-deletion-protection-enabled
+          if out=$(aws dsql delete-cluster --identifier "$OWN_CLUSTER" 2>&1); then
+            record FAIL "deleting its own production cluster succeeded"
+          elif grep -qiE 'deletion.?protection' <<<"$out"; then
+            record PASS "deleting its own production cluster refused by deletion protection ($(code "$out"))"
+          else
+            record FAIL "deleting its own production cluster: $(code "$out")"
+          fi
+
+          {
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            printf '%s\n' "${results[@]}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$failed"
