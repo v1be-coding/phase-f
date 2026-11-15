@@ -1,10 +1,10 @@
-# episode-template
+# phase-f
 
-Where every V1be Coding episode starts.
+Phase F's throwaway episode, made from `episode-template` to prove the Foundation. It is removed once its checks pass.
 
 ## Sites
 
-- **Production:** https://smoke-test.emilianocasijr.com. Setup changes this line for each episode.
+- **Production:** https://phase-f.emilianocasijr.com
 - **Branch environments:** each ready PR gets its own address, printed as `Branch environment: <url>` in its `branch / deploy` job log.
 
 ## Database
